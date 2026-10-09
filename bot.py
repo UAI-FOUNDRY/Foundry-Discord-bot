@@ -1,662 +1,401 @@
+
 import os
-import json
-import re
-import html
+import asyncio
+import sqlite3
 import hashlib
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 import aiohttp
-import feedparser
 import discord
+import feedparser
 
-from bs4 import BeautifulSoup
 from dotenv import load_dotenv
-from discord.ext import tasks
 from discord import app_commands
+from discord.ext import tasks
 
-
-# ============================================================
-# CONFIGURATION
-# ============================================================
 
 load_dotenv()
 
 TOKEN = os.getenv("DISCORD_TOKEN")
+WELCOME_CHANNEL_ID = int(os.getenv("WELCOME_CHANNEL_ID", "0"))
+NEWS_CHANNEL_ID = int(os.getenv("NEWS_CHANNEL_ID", "0"))
 
-# ------------------------------------------------------------
-# PUT YOUR DISCORD CHANNEL IDs HERE
-# ------------------------------------------------------------
+DB_PATH = os.getenv("DB_PATH", "/data/foundry.db")
+IST = ZoneInfo("Asia/Kolkata")
 
-WELCOME_CHANNEL_ID = 1555578807472365569
-NEWS_CHANNEL_ID = 1557853433065635951
+NEWS_INTERVAL_MINUTES = 15
+MAX_POSTS_PER_CHECK = 3
+DIGEST_HOUR = 20  # 8 PM India time
 
-
-# ------------------------------------------------------------
-# NEWS SETTINGS
-# ------------------------------------------------------------
-
-NEWS_INTERVAL_MINUTES = 30
-
-MAX_NEWS_PER_CHECK = 3
-
-RSS_FEEDS = {
+FEEDS = {
+    "OpenAI": "https://openai.com/news/rss.xml",
+    "Google AI": "https://blog.research.google/feeds/posts/default",
+    "Hugging Face": "https://huggingface.co/blog/feed.xml",
     "TechCrunch": "https://techcrunch.com/feed/",
     "The Verge": "https://www.theverge.com/rss/index.xml",
-    "MIT Technology Review": "https://www.technologyreview.com/feed/",
+    "GitHub": "https://github.blog/feed/",
 }
 
 
-# ============================================================
-# DISCORD INTENTS
-# ============================================================
+def connect_db():
+    os.makedirs(os.path.dirname(os.path.abspath(DB_PATH)), exist_ok=True)
+    db = sqlite3.connect(DB_PATH)
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS articles (
+            id TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            url TEXT NOT NULL,
+            source TEXT NOT NULL,
+            published TEXT,
+            discovered_at TEXT NOT NULL,
+            posted INTEGER NOT NULL DEFAULT 0,
+            digested INTEGER NOT NULL DEFAULT 0
+        )
+    """)
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )
+    """)
+    db.commit()
+    return db
 
-intents = discord.Intents.default()
 
-# Required for detecting new members
-intents.members = True
+def utc_now():
+    return datetime.now(timezone.utc).isoformat()
 
 
-# ============================================================
-# BOT
-# ============================================================
+def article_id(url):
+    return hashlib.sha256(url.encode("utf-8")).hexdigest()
+
 
 class FoundryBot(discord.Client):
-
     def __init__(self):
+        intents = discord.Intents.default()
+        intents.members = True
         super().__init__(intents=intents)
-
         self.tree = app_commands.CommandTree(self)
-
-        self.seen_news = self.load_seen_news()
-
-    # --------------------------------------------------------
-    # Load previously posted news
-    # --------------------------------------------------------
-
-    def load_seen_news(self):
-
-        try:
-            with open("seen_news.json", "r", encoding="utf-8") as file:
-                return set(json.load(file))
-
-        except (FileNotFoundError, json.JSONDecodeError):
-            return set()
-
-    # --------------------------------------------------------
-    # Save posted news
-    # --------------------------------------------------------
-
-    def save_seen_news(self):
-
-        # Keep only the newest 1000 items
-        recent = list(self.seen_news)[-1000:]
-
-        with open("seen_news.json", "w", encoding="utf-8") as file:
-            json.dump(recent, file, indent=2)
-
-    # --------------------------------------------------------
-    # Bot is ready
-    # --------------------------------------------------------
+        self.first_scan_done = False
 
     async def setup_hook(self):
-
+        connect_db().close()
         await self.tree.sync()
-
-        print("Slash commands synced.")
-
         self.news_loop.start()
+        self.digest_loop.start()
+        print("Slash commands synced. News and digest schedulers started.")
 
     async def on_ready(self):
-
-        print("--------------------------------")
-        print(f"Logged in as: {self.user}")
-        print(f"Bot ID: {self.user.id}")
-        print("Foundry Bot is ONLINE.")
-        print("--------------------------------")
-
-    # --------------------------------------------------------
-    # NEW MEMBER WELCOME
-    # --------------------------------------------------------
+        print(f"Logged in as {self.user} — AI Foundry bot online.")
 
     async def on_member_join(self, member):
-
         channel = self.get_channel(WELCOME_CHANNEL_ID)
-
         if channel is None:
-            print("Welcome channel not found.")
+            print("Welcome channel not found; check WELCOME_CHANNEL_ID.")
             return
 
-        embed = self.create_welcome_embed(member)
-
-        try:
-
-            await channel.send(
-                content=f"👋 Welcome, {member.mention}!",
-                embed=embed
-            )
-
-            print(f"Welcomed {member}")
-
-        except discord.Forbidden:
-
-            print("Bot does not have permission to send messages.")
-
-        except Exception as error:
-
-            print(f"Welcome error: {error}")
-
-    # --------------------------------------------------------
-    # WELCOME EMBED
-    # --------------------------------------------------------
-
-    def create_welcome_embed(self, member):
-
         embed = discord.Embed(
-
-            title="Welcome to AI Foundry 🚀",
-
+            title="Welcome to AI Foundry",
             description=(
-                "Welcome to **AI Foundry** — a student-driven community "
-                "focused on **Artificial Intelligence, technology, research, "
-                "and building real-world solutions.**\n\n"
-
-                "Whether you're here to learn, build, collaborate, "
-                "share ideas, or simply explore AI, you're in the right place."
+                "A student-driven community focused on artificial "
+                "intelligence, technology, research, and building "
+                "real-world solutions.\n\n"
+                "**Before you get started**\n"
+                "Please read the rules in this channel and follow the "
+                "server guidelines.\n\n"
+                "**Explore the community**\n"
+                "• Join conversations in #general-chat\n"
+                "• Share ideas in #idea-box\n"
+                "• Explore #project-showcase\n"
+                "• Follow #news_updates for technology headlines\n\n"
+                "Learn. Build. Innovate."
             ),
-
-            color=discord.Color.blurple()
+            color=discord.Color.blurple(),
         )
-
-        embed.add_field(
-
-            name="📜 Before you get started",
-
-            value=(
-                "Please take a moment to read the rules and "
-                "guidelines in this channel."
-            ),
-
-            inline=False
-        )
-
-        embed.add_field(
-
-            name="💬 Join the community",
-
-            value=(
-                "Share your thoughts in `#general-chat`, "
-                "discuss technology, and connect with other members."
-            ),
-
-            inline=False
-        )
-
-        embed.add_field(
-
-            name="💡 Have an idea?",
-
-            value=(
-                "Drop it in `#idea-box` or contribute a real-world "
-                "problem to `#problem-pool`."
-            ),
-
-            inline=False
-        )
-
-        embed.add_field(
-
-            name="🚀 See what we're building",
-
-            value=(
-                "Check `#project-showcase` to explore projects "
-                "created by AI Foundry."
-            ),
-
-            inline=False
-        )
-
-        embed.add_field(
-
-            name="📰 Stay updated",
-
-            value=(
-                "Follow `#news_updates` for important AI and "
-                "technology industry updates."
-            ),
-
-            inline=False
-        )
-
         embed.set_thumbnail(url=member.display_avatar.url)
-
-        embed.set_footer(
-            text="AI Foundry • Learn. Build. Innovate."
-        )
-
-        return embed
-
-    # ========================================================
-    # NEWS SYSTEM
-    # ========================================================
-
-    async def fetch_feed(self, source, url):
+        embed.set_footer(text="AI Foundry • Community & Innovation")
 
         try:
-
-            async with aiohttp.ClientSession() as session:
-
-                async with session.get(
-
-                    url,
-
-                    timeout=aiohttp.ClientTimeout(total=15),
-
-                    headers={
-                        "User-Agent": "AI-Foundry-News-Bot/1.0"
-                    }
-
-                ) as response:
-
-                    if response.status != 200:
-
-                        print(
-                            f"{source}: HTTP {response.status}"
-                        )
-
-                        return []
-
-                    data = await response.read()
-
-                    feed = feedparser.parse(data)
-
-                    articles = []
-
-                    for entry in feed.entries[:10]:
-
-                        title = entry.get(
-                            "title",
-                            "Untitled"
-                        ).strip()
-
-                        link = entry.get(
-                            "link",
-                            ""
-                        ).strip()
-
-                        description = entry.get(
-                            "summary",
-                            entry.get("description", "")
-                        )
-
-                        published = entry.get(
-                            "published",
-                            ""
-                        )
-
-                        if not title or not link:
-                            continue
-
-                        article_id = hashlib.sha256(
-                            link.encode("utf-8")
-                        ).hexdigest()
-
-                        articles.append({
-
-                            "id": article_id,
-
-                            "source": source,
-
-                            "title": title,
-
-                            "link": link,
-
-                            "description": description,
-
-                            "published": published
-                        })
-
-                    return articles
-
-        except Exception as error:
-
-            print(
-                f"Error fetching {source}: {error}"
+            await channel.send(
+                content=f"Welcome to AI Foundry, {member.mention}!",
+                embed=embed,
             )
+        except discord.HTTPException as exc:
+            print(f"Welcome message failed: {exc}")
 
+    async def fetch_feed(self, session, source, url):
+        try:
+            async with session.get(url) as response:
+                if response.status != 200:
+                    print(f"{source} feed returned HTTP {response.status}")
+                    return []
+
+                content = await response.read()
+
+            feed = await asyncio.to_thread(feedparser.parse, content)
+            results = []
+
+            for entry in feed.entries[:20]:
+                title = entry.get("title", "").strip()
+                link = entry.get("link", "").strip()
+                if not title or not link.startswith(("https://", "http://")):
+                    continue
+
+                results.append({
+                    "id": article_id(link),
+                    "title": title[:250],
+                    "url": link,
+                    "source": source,
+                    "published": entry.get("published", ""),
+                })
+
+            return results
+
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            print(f"Could not fetch {source}: {exc}")
             return []
 
-    # --------------------------------------------------------
-    # Clean HTML from descriptions
-    # --------------------------------------------------------
+    async def collect_articles(self):
+        timeout = aiohttp.ClientTimeout(total=20)
+        headers = {"User-Agent": "AIFoundryDiscordBot/1.0"}
 
-    def clean_description(self, text):
-
-        if not text:
-            return "No description available."
-
-        text = html.unescape(text)
-
-        soup = BeautifulSoup(
-            text,
-            "html.parser"
-        )
-
-        text = soup.get_text(
-            separator=" ",
-            strip=True
-        )
-
-        text = re.sub(
-            r"\s+",
-            " ",
-            text
-        )
-
-        # Discord embed description limit
-        if len(text) > 500:
-
-            text = text[:497] + "..."
-
-        return text
-
-    # --------------------------------------------------------
-    # Create news embed
-    # --------------------------------------------------------
-
-    def create_news_embed(self, article):
-
-        description = self.clean_description(
-            article["description"]
-        )
-
-        embed = discord.Embed(
-
-            title=article["title"],
-
-            url=article["link"],
-
-            description=description,
-
-            color=discord.Color.blue()
-        )
-
-        embed.add_field(
-
-            name="📰 Source",
-
-            value=article["source"],
-
-            inline=True
-        )
-
-        embed.add_field(
-
-            name="🏷️ Category",
-
-            value="Technology / AI",
-
-            inline=True
-        )
-
-        embed.set_footer(
-
-            text="AI Foundry • Tech Intelligence"
-        )
-
-        return embed
-
-    # --------------------------------------------------------
-    # Get news
-    # --------------------------------------------------------
-
-    async def get_latest_news(self):
-
-        all_articles = []
-
-        for source, url in RSS_FEEDS.items():
-
-            articles = await self.fetch_feed(
-                source,
-                url
+        async with aiohttp.ClientSession(
+            timeout=timeout, headers=headers
+        ) as session:
+            batches = await asyncio.gather(
+                *[
+                    self.fetch_feed(session, source, url)
+                    for source, url in FEEDS.items()
+                ]
             )
 
-            all_articles.extend(articles)
+        return [item for batch in batches for item in batch]
 
-        return all_articles
+    def make_embed(self, article):
+        embed = discord.Embed(
+            title=article["title"],
+            url=article["url"],
+            description=f"**Source:** {article['source']}",
+            color=discord.Color.blurple(),
+        )
+        if article.get("published"):
+            embed.add_field(
+                name="Published",
+                value=article["published"][:100],
+                inline=False,
+            )
+        embed.set_footer(text="AI Foundry • Tech Intelligence")
+        return embed
 
-    # --------------------------------------------------------
-    # Automatic news loop
-    # --------------------------------------------------------
+    async def run_news_check(self):
+        channel = self.get_channel(NEWS_CHANNEL_ID)
+        if channel is None:
+            print("News channel not found; check NEWS_CHANNEL_ID.")
+            return
+
+        articles = await self.collect_articles()
+        db = connect_db()
+
+        try:
+            # On first run, register existing stories without flooding Discord.
+            if not self.first_scan_done:
+                for item in articles:
+                    db.execute(
+                        """INSERT OR IGNORE INTO articles
+                        (id, title, url, source, published, discovered_at)
+                        VALUES (?, ?, ?, ?, ?, ?)""",
+                        (
+                            item["id"], item["title"], item["url"],
+                            item["source"], item["published"], utc_now(),
+                        ),
+                    )
+                db.commit()
+                self.first_scan_done = True
+                print(f"Initial scan complete: {len(articles)} articles checked.")
+                return
+
+            new_items = []
+            for item in articles:
+                cursor = db.execute(
+                    """INSERT OR IGNORE INTO articles
+                    (id, title, url, source, published, discovered_at)
+                    VALUES (?, ?, ?, ?, ?, ?)""",
+                    (
+                        item["id"], item["title"], item["url"],
+                        item["source"], item["published"], utc_now(),
+                    ),
+                )
+                if cursor.rowcount == 1:
+                    new_items.append(item)
+
+            db.commit()
+
+            # Post oldest first when a feed returns multiple new items.
+            new_items = list(reversed(new_items))[:MAX_POSTS_PER_CHECK]
+
+            for item in new_items:
+                try:
+                    await channel.send(embed=self.make_embed(item))
+                    db.execute(
+                        "UPDATE articles SET posted = 1 WHERE id = ?",
+                        (item["id"],),
+                    )
+                    db.commit()
+                    print(f"Posted headline: {item['title']}")
+                except discord.HTTPException as exc:
+                    print(f"Could not post headline: {exc}")
+
+        finally:
+            db.close()
 
     @tasks.loop(minutes=NEWS_INTERVAL_MINUTES)
     async def news_loop(self):
-
-        print("Checking for new technology news...")
-
-        channel = self.get_channel(
-            NEWS_CHANNEL_ID
-        )
-
-        if channel is None:
-
-            print(
-                "News channel not found."
-            )
-
-            return
-
-        articles = await self.get_latest_news()
-
-        new_articles = []
-
-        for article in articles:
-
-            if article["id"] not in self.seen_news:
-
-                new_articles.append(article)
-
-        # ----------------------------------------------------
-        # First run protection
-        # ----------------------------------------------------
-
-        if not self.seen_news:
-
-            print(
-                "First news scan. "
-                "Marking existing articles as seen."
-            )
-
-            for article in articles:
-
-                self.seen_news.add(
-                    article["id"]
-                )
-
-            self.save_seen_news()
-
-            return
-
-        # ----------------------------------------------------
-        # Send only a few news articles
-        # ----------------------------------------------------
-
-        new_articles = new_articles[
-            :MAX_NEWS_PER_CHECK
-        ]
-
-        for article in new_articles:
-
-            try:
-
-                embed = self.create_news_embed(
-                    article
-                )
-
-                await channel.send(
-                    embed=embed
-                )
-
-                self.seen_news.add(
-                    article["id"]
-                )
-
-            except Exception as error:
-
-                print(
-                    f"Error sending news: {error}"
-                )
-
-        self.save_seen_news()
-
-    # --------------------------------------------------------
-    # Wait until bot is ready before news loop
-    # --------------------------------------------------------
+        await self.run_news_check()
 
     @news_loop.before_loop
     async def before_news_loop(self):
-
         await self.wait_until_ready()
 
+    @tasks.loop(minutes=1)
+    async def digest_loop(self):
+        now = datetime.now(IST)
+        if now.hour != DIGEST_HOUR or now.minute != 0:
+            return
 
-# ============================================================
-# CREATE BOT
-# ============================================================
+        today = now.date().isoformat()
+        db = connect_db()
+
+        try:
+            row = db.execute(
+                "SELECT value FROM settings WHERE key = 'last_digest_date'"
+            ).fetchone()
+            if row and row[0] == today:
+                return
+
+            channel = self.get_channel(NEWS_CHANNEL_ID)
+            if channel is None:
+                print("Digest channel not found.")
+                return
+
+            rows = db.execute("""
+                SELECT id, title, url, source
+                FROM articles
+                WHERE posted = 1 AND digested = 0
+                ORDER BY discovered_at ASC
+                LIMIT 20
+            """).fetchall()
+
+            if rows:
+                embed = discord.Embed(
+                    title=f"AI Foundry Daily Tech Brief — {now:%d %b %Y}",
+                    description="\n".join(
+                        f"• [{title}]({url}) — **{source}**"
+                        for _, title, url, source in rows
+                    )[:4000],
+                    color=discord.Color.dark_purple(),
+                )
+                embed.set_footer(
+                    text="A daily roundup of headlines • Read the original sources"
+                )
+
+                await channel.send(embed=embed)
+                db.executemany(
+                    "UPDATE articles SET digested = 1 WHERE id = ?",
+                    [(row[0],) for row in rows],
+                )
+
+            db.execute(
+                """INSERT INTO settings(key, value)
+                VALUES ('last_digest_date', ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value""",
+                (today,),
+            )
+            db.commit()
+            print(f"Daily digest checked for {today}.")
+
+        except discord.HTTPException as exc:
+            print(f"Daily digest failed: {exc}")
+        finally:
+            db.close()
+
+    @digest_loop.before_loop
+    async def before_digest_loop(self):
+        await self.wait_until_ready()
+
+    async def post_manual_news(self, interaction):
+        await interaction.response.defer(ephemeral=True)
+        items = await self.collect_articles()
+        if not items:
+            await interaction.followup.send(
+                "I couldn't fetch headlines right now. Check the Railway logs.",
+                ephemeral=True,
+            )
+            return
+
+        # This command previews the newest feed entries; it doesn't repost them
+        # to the public channel or mark them as published.
+        for item in items[:5]:
+            await interaction.followup.send(
+                embed=self.make_embed(item), ephemeral=True
+            )
+
 
 bot = FoundryBot()
 
 
-# ============================================================
-# /PING
-# ============================================================
-
-@bot.tree.command(
-    name="ping",
-    description="Check if Foundry Bot is online."
-)
+@bot.tree.command(name="ping", description="Check whether Foundry is online.")
 async def ping(interaction: discord.Interaction):
-
-    latency = round(
-        bot.latency * 1000
-    )
-
     await interaction.response.send_message(
-        f"🏓 Pong! **{latency}ms**"
+        f"Pong! {round(bot.latency * 1000)} ms", ephemeral=True
     )
 
 
-# ============================================================
-# /TESTWELCOME
-# ============================================================
-
-@bot.tree.command(
-    name="testwelcome",
-    description="Test the AI Foundry welcome message."
-)
-@app_commands.checks.has_permissions(
-    manage_guild=True
-)
-async def testwelcome(
-    interaction: discord.Interaction
-):
-
-    embed = bot.create_welcome_embed(
-        interaction.user
-    )
-
-    await interaction.response.send_message(
-        content=(
-            f"👋 Welcome, "
-            f"{interaction.user.mention}!"
+@bot.tree.command(name="testwelcome", description="Preview the welcome message.")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def testwelcome(interaction: discord.Interaction):
+    embed = discord.Embed(
+        title="Welcome to AI Foundry",
+        description=(
+            "A student-driven community focused on AI, technology, research, "
+            "and building real-world solutions.\n\n"
+            "**Before you get started**\n"
+            "Please read the rules in this channel.\n\n"
+            "**Explore the community**\n"
+            "• #general-chat\n• #idea-box\n• #project-showcase\n"
+            "• #news_updates\n\nLearn. Build. Innovate."
         ),
-        embed=embed
+        color=discord.Color.blurple(),
     )
-
-
-# ============================================================
-# /NEWS
-# ============================================================
-
-@bot.tree.command(
-    name="news",
-    description="Fetch the latest technology news."
-)
-async def news(
-    interaction: discord.Interaction
-):
-
-    await interaction.response.defer()
-
-    articles = await bot.get_latest_news()
-
-    if not articles:
-
-        await interaction.followup.send(
-            "❌ I couldn't retrieve the latest news right now."
-        )
-
-        return
-
-    articles = articles[:5]
-
-    for article in articles:
-
-        embed = bot.create_news_embed(
-            article
-        )
-
-        await interaction.followup.send(
-            embed=embed
-        )
-
-
-# ============================================================
-# ERROR HANDLING
-# ============================================================
-
-@ping.error
-async def ping_error(
-    interaction,
-    error
-):
-
-    print(
-        f"Ping command error: {error}"
-    )
+    embed.set_footer(text="AI Foundry • Community & Innovation")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 @testwelcome.error
 async def testwelcome_error(
-    interaction,
-    error
+    interaction: discord.Interaction, error: app_commands.AppCommandError
 ):
-
-    if isinstance(
-        error,
-        app_commands.errors.MissingPermissions
-    ):
-
-        await interaction.response.send_message(
-            "❌ You need **Manage Server** permission "
-            "to use this command.",
-            ephemeral=True
-        )
-
+    message = (
+        "You need Manage Server permission to use this command."
+        if isinstance(error, app_commands.errors.MissingPermissions)
+        else "The command failed. Check the bot logs."
+    )
+    if interaction.response.is_done():
+        await interaction.followup.send(message, ephemeral=True)
     else:
-
-        print(
-            f"Welcome command error: {error}"
-        )
+        await interaction.response.send_message(message, ephemeral=True)
 
 
-# ============================================================
-# START BOT
-# ============================================================
+@bot.tree.command(name="news", description="Preview the latest tech headlines.")
+async def news(interaction: discord.Interaction):
+    await bot.post_manual_news(interaction)
+
 
 if not TOKEN:
-
+    raise RuntimeError("DISCORD_TOKEN is missing from environment variables.")
+if not WELCOME_CHANNEL_ID or not NEWS_CHANNEL_ID:
     raise RuntimeError(
-        "DISCORD_TOKEN is missing from your .env file."
+        "Set WELCOME_CHANNEL_ID and NEWS_CHANNEL_ID in Railway Variables."
     )
-
 
 bot.run(TOKEN)
